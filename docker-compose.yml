@@ -1,0 +1,95 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: jungle-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_TEST_DB: ${DB_NAME_TEST:-jungle_wagering_test}
+
+    ports:
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sh:/docker-entrypoint-initdb.d/10-test-database.sh:ro
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:3.8.1
+    container_name: jungle-localstack
+    restart: unless-stopped
+
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+
+    ports:
+      - "127.0.0.1:4566:4566"
+
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/10-sqs-queues.sh:ro
+
+    healthcheck:
+      # Healthy only after the init scripts finished (queues exist).
+      test:
+        - CMD-SHELL
+        - "curl -sf http://localhost:4566/_localstack/init/ready | grep -q '\"completed\": true'"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # --- Application (optional): `docker compose --profile app up -d --build` ---
+  # One-off migration, then 3 replicas of the API behind host ports 3000-3002.
+  migrate:
+    profiles: ["app"]
+    build: ./api
+    command: ["bun", "scripts/migrate.ts", "up"]
+    environment: &app-env
+      NODE_ENV: production
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_POOL_MAX: ${DB_POOL_MAX:-20}
+      LOCK_TIMEOUT_MS: ${LOCK_TIMEOUT_MS:-5000}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    profiles: ["app"]
+    build: ./api
+    restart: unless-stopped
+    deploy:
+      replicas: 3
+    environment: *app-env
+    ports:
+      - "127.0.0.1:3000-3002:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  localstack_data:

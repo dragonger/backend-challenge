@@ -1,0 +1,3 @@
+[test]
+# Integration tests talk to a real PostgreSQL; allow generous timeouts.
+timeout = 60000
